@@ -1,0 +1,165 @@
+
+name: Alertas SmileGames
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alertas-smilegames
+  cancel-in-progress: false
+
+jobs:
+  revisar-publicaciones:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Consultar Facebook y avisar por Telegram
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import urllib.request
+          import urllib.parse
+
+          apify_token = os.environ["APIFY_TOKEN"]
+          bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+          if not apify_token or not bot_token or not chat_id:
+              raise RuntimeError("Falta configurar uno de los secretos.")
+
+          def api_request(url, data=None, method=None):
+              headers = {
+                  "Authorization": "Bearer " + apify_token
+              }
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+                  data = json.dumps(data).encode("utf-8")
+              req = urllib.request.Request(
+                  url, data=data, headers=headers, method=method
+              )
+              with urllib.request.urlopen(req, timeout=180) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          actor_input = {
+              "captionText": False,
+              "resultsLimit": 1,
+              "startUrls": [
+                  {
+                      "url": "https://www.facebook.com/SmileGamesBta",
+                      "method": "GET"
+                  }
+              ]
+          }
+
+          print("Consultando la última publicación...")
+          run_result = api_request(
+              "https://api.apify.com/v2/acts/KoJrdxJCTtpon81KY/runs"
+              "?waitForFinish=120",
+              actor_input,
+              "POST"
+          )
+
+          run_data = run_result["data"]
+          if run_data.get("status") != "SUCCEEDED":
+              raise RuntimeError(
+                  "La consulta de Apify no terminó correctamente. Estado: "
+                  + str(run_data.get("status"))
+              )
+
+          dataset_id = run_data["defaultDatasetId"]
+          items_url = (
+              "https://api.apify.com/v2/datasets/"
+              + urllib.parse.quote(dataset_id, safe="")
+              + "/items?format=json&clean=true&limit=1"
+          )
+          items = api_request(items_url)
+
+          if not items:
+              raise RuntimeError("Apify no devolvió publicaciones.")
+
+          post = items[0]
+          post_url = post.get("url") or post.get("topLevelUrl")
+          if not post_url:
+              raise RuntimeError("La publicación no contiene una URL.")
+
+          state_file = pathlib.Path("last_post.txt")
+          previous_url = (
+              state_file.read_text(encoding="utf-8").strip()
+              if state_file.exists() else ""
+          )
+
+          if not previous_url:
+              print("Primera ejecución: registrando la publicación actual.")
+              print("No se enviará una alerta antigua.")
+          elif post_url != previous_url:
+              text = (post.get("text") or "").strip()
+              if len(text) > 900:
+                  text = text[:900].rstrip() + "…"
+
+              message = (
+                  "🆕 Nueva publicación de SmileGames\n\n"
+                  + text
+                  + "\n\n🔗 Ver publicación:\n"
+                  + post_url
+              )
+
+              telegram_url = (
+                  "https://api.telegram.org/bot"
+                  + bot_token
+                  + "/sendMessage"
+              )
+              payload = {
+                  "chat_id": chat_id,
+                  "text": message,
+                  "disable_web_page_preview": False
+              }
+              req = urllib.request.Request(
+                  telegram_url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+                  method="POST"
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  result = json.loads(response.read().decode("utf-8"))
+
+              if not result.get("ok"):
+                  raise RuntimeError("Telegram no confirmó el envío.")
+
+              print("Alerta enviada a Telegram.")
+          else:
+              print("No hay publicaciones nuevas.")
+
+          state_file.write_text(post_url + "\n", encoding="utf-8")
+          PY
+
+      - name: Guardar última publicación revisada
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last_post.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "Actualizar última publicación revisada"
+            git push
+          fi
